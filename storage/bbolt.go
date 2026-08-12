@@ -15,6 +15,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
+	rpcc "github.com/deroproject/derohe/rpc"
 	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
 
@@ -45,6 +46,23 @@ var (
 	// legacy-then-composite.
 	bucketNormTx  = []byte("normaltxwithscid")
 	bucketInvalid = []byte("invalidscidinvokes")
+	// bucketNormTxSCID is a reverse index over bucketNormTx keyed by SCID:
+	// "<scid>|<addr>:<BE8:h>:<txid>" -> the same single-record value bytes as
+	// bucketNormTx. Grows alongside the existing normaltx flush write so
+	// GetAllNormalTxWithSCIDBySCID is a prefix scan. Read-only for compat;
+	// not rewritten by truncate (it is derived from the same append-only data).
+	bucketNormTxSCID = []byte("normaltxwithscid_scid")
+
+	// bucketGetInfo holds the most recent daemon DERO.GetInfo result under a
+	// fixed key. Written by the indexer's height monitor each poll cycle so
+	// civilware's GetGetInfoDetails returns real chain metrics.
+	bucketGetInfo = []byte("getinfo_snapshot")
+
+	// Miniblock store (civilware miniblock-index compat).
+	// bucketMBL: "<BE8 block hash>" -> msgpack []*MBLInfo for one block.
+	// bucketMBLCount: addr -> BE8 uint64 miniblock count.
+	bucketMBL      = []byte("miniblocks")
+	bucketMBLCount = []byte("miniblockcount")
 
 	// Route B (DESIGN.md §3) buckets.
 	bucketBlockHash   = []byte("blockhashes")  // BE8 height -> 64-hex block hash
@@ -66,6 +84,7 @@ var namedBuckets = [][]byte{
 	bucketStats, bucketOwners, bucketHeaders,
 	bucketClass, bucketTags, bucketHeight,
 	bucketScVars, bucketScVarsLatest, bucketNormTx, bucketInvalid,
+	bucketNormTxSCID, bucketGetInfo, bucketMBL, bucketMBLCount,
 	// Route B M0
 	bucketBlockHash, bucketInstalls, bucketClassIdx,
 	bucketAddrSCIDs, bucketTELAContent, bucketSCCode,
@@ -133,6 +152,20 @@ func appendNormTxKey(dst []byte, addr string, h int64, txid, scid string) []byte
 	dst = append(dst, txid...)
 	dst = append(dst, ':')
 	return append(dst, scid...)
+}
+
+// appendNormTxSCIDKey builds the bucketNormTxSCID key:
+// "<scid>|<addr>:<BE8:h>:<txid>". The scid comes first so the reverse index is
+// a simple prefix scan per SCID. The trailing components mirror
+// appendNormTxKey so a record is reconstructable from either index.
+func appendNormTxSCIDKey(dst []byte, scid, addr string, h int64, txid string) []byte {
+	dst = append(dst, scid...)
+	dst = append(dst, '|')
+	dst = append(dst, addr...)
+	dst = append(dst, ':')
+	dst = append(dst, encHeight(h)...)
+	dst = append(dst, ':')
+	return append(dst, txid...)
 }
 
 // sortedBatchKeys returns a map's keys in ascending order. Go map iteration
@@ -245,6 +278,14 @@ const mainStoreMmapSize = 256 << 20
 // mainStoreFile is the bbolt filename inside the db dir. Kept as a const so the
 // open path and the compact subcommand (CompactBbolt) cannot drift apart.
 const mainStoreFile = "HYPERGNOMON.db"
+
+// MainStoreFilePath returns the on-disk path of the bbolt database inside a
+// dbDir. Exported so tooling outside this package (e.g. the gnomes compat
+// storage layer's ValidateStore) opens the exact same file the store uses
+// without duplicating the filename constant.
+func MainStoreFilePath(dbDir string) string {
+	return filepath.Join(dbDir, mainStoreFile)
+}
 
 // NewBboltStoreWithMmap opens or creates a BoltDB database with an explicit
 // initial mmap reservation. Short-lived bounded stores — the per-segment
@@ -891,6 +932,10 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 		// on their still-live old backing array, and appends never mutate an
 		// earlier sub-slice's bytes.
 		normTxValArena := make([]byte, 0, 1024)
+		// Reverse index (bucketNormTxSCID): one extra logical Put per record
+		// reusing the SAME value bytes. Key is "<scid>|<addr>:<BE8:h>:<txid>"
+		// so a per-SCID prefix scan returns every participant record.
+		normTxSCIDBucket := tx.Bucket(bucketNormTxSCID)
 		for i := range batch.NormalTxs {
 			e := &batch.NormalTxs[i]
 			keyBuf = appendNormTxKey(keyBuf[:0], e.Addr, e.Tx.Height, e.Tx.Txid, e.Tx.Scid)
@@ -898,7 +943,50 @@ func (s *BboltStore) FlushBatch(batch *WriteBatch) error {
 			// DecodeNormalTxEntry dispatches typed-vs-legacy by byte[0].
 			vStart := len(normTxValArena)
 			normTxValArena = e.Tx.MarshalTypedAppend(normTxValArena)
-			if err := normBucket.Put(keyBuf, normTxValArena[vStart:]); err != nil {
+			val := normTxValArena[vStart:]
+			if err := normBucket.Put(keyBuf, val); err != nil {
+				return err
+			}
+			if err := normTxSCIDBucket.Put(appendNormTxSCIDKey(nil, e.Tx.Scid, e.Addr, e.Tx.Height, e.Tx.Txid), val); err != nil {
+				return err
+			}
+		}
+
+		// Store miniblocks: group consecutive same-block-hash refs into one
+		// msgpack []*MBLInfo per blid. Idempotent — a blid already present is
+		// left untouched (blocks are mined exactly once per indexer; a reorg's
+		// truncate+replay re-writes superseded records via TruncateToHeight).
+		if mbB := tx.Bucket(bucketMBL); mbB != nil && len(batch.Miniblocks) > 0 {
+			slices.SortFunc(batch.Miniblocks, func(a, b MiniblockRef) int {
+				return strings.Compare(a.BlockHash, b.BlockHash)
+			})
+			var curBlid string
+			var group []*structures.MBLInfo
+			flushGroup := func() error {
+				if curBlid == "" || len(group) == 0 {
+					return nil
+				}
+				if mbB.Get([]byte(curBlid)) != nil {
+					return nil // already stored — idempotent overwrite guard
+				}
+				val, err := msgpack.Marshal(group)
+				if err != nil {
+					return err
+				}
+				return mbB.Put([]byte(curBlid), val)
+			}
+			for i := range batch.Miniblocks {
+				r := &batch.Miniblocks[i]
+				if r.BlockHash != curBlid {
+					if err := flushGroup(); err != nil {
+						return err
+					}
+					curBlid, group = r.BlockHash, group[:0]
+				}
+				m := r.MBL
+				group = append(group, &m)
+			}
+			if err := flushGroup(); err != nil {
 				return err
 			}
 		}
@@ -1930,4 +2018,158 @@ func (s *BboltStore) GetNormalTxWithSCIDByAddr(addr string) ([]*structures.Norma
 		return nil
 	})
 	return txs, err
+}
+
+// GetNormalTxWithSCIDBySCID returns every normal-TX record referencing `scid`,
+// regardless of participant address. Backed by the append-only reverse index
+// bucketNormTxSCID ("<scid>|<addr>:<BE8:h>:<txid>" -> typed record). Order is
+// bbolt cursor order (addr, then height).
+func (s *BboltStore) GetNormalTxWithSCIDBySCID(scid string) ([]*structures.NormalTXWithSCIDParse, error) {
+	if scid == "" {
+		return nil, nil
+	}
+	var txs []*structures.NormalTXWithSCIDParse
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNormTxSCID)
+		if b == nil {
+			return nil
+		}
+		prefix := append([]byte(scid), '|')
+		c := b.Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			rec := &structures.NormalTXWithSCIDParse{}
+			if structures.IsNormalTxTyped(v) {
+				if err := rec.UnmarshalTyped(v); err != nil {
+					logger.Warnf("normaltx scid-index typed decode: %v", err)
+					continue
+				}
+			} else if err := msgpack.Unmarshal(v, rec); err != nil {
+				logger.Warnf("normaltx scid-index decode: %v", err)
+				continue
+			}
+			txs = append(txs, rec)
+		}
+		return nil
+	})
+	return txs, err
+}
+
+// StoreGetInfo persists the most recent daemon DERO.GetInfo result under the
+// fixed snapshot key. Overwrites the previous snapshot each poll cycle.
+func (s *BboltStore) StoreGetInfo(info *rpcc.GetInfo_Result) error {
+	if info == nil {
+		return fmt.Errorf("StoreGetInfo: nil info")
+	}
+	val, err := msgpack.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("StoreGetInfo marshal: %w", err)
+	}
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketGetInfo).Put([]byte("latest"), val)
+	})
+}
+
+// GetStoredGetInfo returns the last persisted DERO.GetInfo result, or nil when
+// the indexer has never polled (fresh DB or no daemon contact yet).
+func (s *BboltStore) GetStoredGetInfo() (*rpcc.GetInfo_Result, error) {
+	var info *rpcc.GetInfo_Result
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketGetInfo).Get([]byte("latest"))
+		if v == nil {
+			return nil
+		}
+		var out rpcc.GetInfo_Result
+		if err := msgpack.Unmarshal(v, &out); err != nil {
+			return fmt.Errorf("GetStoredGetInfo unmarshal: %w", err)
+		}
+		info = &out
+		return nil
+	})
+	return info, err
+}
+
+// StoreMiniblockDetails stores the miniblock records for the block identified
+// by `blid` (the block's 64-hex hash — civilware's key shape). Overwrites any
+// prior record for the same blid.
+func (s *BboltStore) StoreMiniblockDetails(blid string, mbls []*structures.MBLInfo) error {
+	if blid == "" {
+		return fmt.Errorf("StoreMiniblockDetails: empty blid")
+	}
+	val, err := msgpack.Marshal(mbls)
+	if err != nil {
+		return fmt.Errorf("StoreMiniblockDetails marshal: %w", err)
+	}
+	return s.DB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMBL).Put([]byte(blid), val)
+	})
+}
+
+// GetAllMiniblockDetails returns every stored miniblock record keyed by its
+// parent block hash. Empty map for a fresh store.
+func (s *BboltStore) GetAllMiniblockDetails() (map[string][]*structures.MBLInfo, error) {
+	result := make(map[string][]*structures.MBLInfo)
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMBL)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var mbls []*structures.MBLInfo
+			if err := msgpack.Unmarshal(v, &mbls); err != nil {
+				logger.Warnf("miniblock decode for %s: %v", string(k), err)
+				return nil
+			}
+			result[string(k)] = mbls
+			return nil
+		})
+	})
+	return result, err
+}
+
+// GetMiniblockDetailsByHash returns the miniblock records for one block hash,
+// or nil when the block has no stored miniblock records.
+func (s *BboltStore) GetMiniblockDetailsByHash(blid string) ([]*structures.MBLInfo, error) {
+	var mbls []*structures.MBLInfo
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketMBL).Get([]byte(blid))
+		if v == nil {
+			return nil
+		}
+		if err := msgpack.Unmarshal(v, &mbls); err != nil {
+			return fmt.Errorf("miniblock decode for %s: %w", blid, err)
+		}
+		return nil
+	})
+	return mbls, err
+}
+
+// GetMiniblockCountByAddress counts stored miniblock records whose miner
+// resolves to `addr`. Scans the miniblock bucket (counts are derived, so
+// reorg truncate cannot drift them). Only final miniblocks carry a resolvable
+// miner (see structures.MBLInfo), so this effectively counts final
+// miniblocks mined by addr.
+func (s *BboltStore) GetMiniblockCountByAddress(addr string) (int64, error) {
+	if addr == "" {
+		return 0, nil
+	}
+	var count int64
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMBL)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var mbls []*structures.MBLInfo
+			if err := msgpack.Unmarshal(v, &mbls); err != nil {
+				return nil
+			}
+			for _, m := range mbls {
+				if m != nil && m.Miner == addr {
+					count++
+				}
+			}
+			return nil
+		})
+	})
+	return count, err
 }

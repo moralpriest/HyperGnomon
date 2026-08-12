@@ -3,6 +3,8 @@ package storage
 import (
 	"sync"
 
+	rpcc "github.com/deroproject/derohe/rpc"
+
 	"github.com/hypergnomon/hypergnomon/structures"
 )
 
@@ -51,6 +53,24 @@ type Storage interface {
 	GetInvalidSCIDDeploys() (map[string]uint64, error)
 	GetTxCounts() (reg, burn, norm int64, err error)
 	GetNormalTxWithSCIDByAddr(addr string) ([]*structures.NormalTXWithSCIDParse, error)
+
+	// Reverse index over bucketNormTx: all normal TX records whose SCID
+	// matches, regardless of participant address. Powers civilware's
+	// GetAllNormalTxWithSCIDBySCID.
+	GetNormalTxWithSCIDBySCID(scid string) ([]*structures.NormalTXWithSCIDParse, error)
+
+	// GetInfo snapshot: the most recent daemon DERO.GetInfo result, stored by
+	// the indexer's height monitor. Powers civilware's GetGetInfoDetails.
+	StoreGetInfo(info *rpcc.GetInfo_Result) error
+	GetStoredGetInfo() (*rpcc.GetInfo_Result, error)
+
+	// Miniblock index (civilware miniblock compat). Details keyed by the
+	// parent BLOCK hash (civilware's "blid"); each value is the block's
+	// []*MBLInfo. GetMiniblockCountByAddress scans stored miner addresses.
+	StoreMiniblockDetails(blid string, mbls []*structures.MBLInfo) error
+	GetAllMiniblockDetails() (map[string][]*structures.MBLInfo, error)
+	GetMiniblockDetailsByHash(blid string) ([]*structures.MBLInfo, error)
+	GetMiniblockCountByAddress(addr string) (int64, error)
 
 	// Batch operations (arena-style bulk commit)
 	FlushBatch(batch *WriteBatch) error
@@ -145,16 +165,29 @@ type NormalTxRef struct {
 	Tx   structures.NormalTXWithSCIDParse
 }
 
+// MiniblockRef pairs one miniblock record with its parent block hash. The
+// block hash is the store key (civilware's "blid"); MBLInfo holds the
+// miniblock hash + miner.
+type MiniblockRef struct {
+	BlockHash string
+	MBL       structures.MBLInfo
+}
+
 // WriteBatch accumulates writes across multiple blocks for atomic commit.
 // This is the arena pattern applied to database writes:
 // accumulate everything, flush once, instead of per-item writes.
 type WriteBatch struct {
-	Owners       map[string]string                     // scid -> owner
-	Invocations  []structures.InvokeRecord             // all invocations
-	Variables    map[VarKey][]*structures.SCIDVariable // (scid, height) -> vars snapshot
-	Heights      map[string][]int64                    // scid -> interaction heights
-	NormalTxs    []NormalTxRef                         // flat (addr, tx) pairs
-	InvalidSCIDs map[string]uint64                     // scid -> fees
+	Owners      map[string]string                     // scid -> owner
+	Invocations []structures.InvokeRecord             // all invocations
+	Variables   map[VarKey][]*structures.SCIDVariable // (scid, height) -> vars snapshot
+	Heights     map[string][]int64                    // scid -> interaction heights
+	NormalTxs   []NormalTxRef                         // flat (addr, tx) pairs
+	// Miniblocks flushes per-miniblock records grouped by parent block hash.
+	// One MiniblockRef per miniblock; FlushBatch groups consecutive same-hash
+	// refs into a single msgpack []*MBLInfo value (civilware's
+	// StoreMiniblockDetailsByHash shape).
+	Miniblocks   []MiniblockRef
+	InvalidSCIDs map[string]uint64 // scid -> fees
 	RegTxCount   int64
 	BurnTxCount  int64
 	NormTxCount  int64
@@ -218,6 +251,7 @@ func newEmptyBatch() *WriteBatch {
 		Variables:     make(map[VarKey][]*structures.SCIDVariable, 64),
 		Heights:       make(map[string][]int64, 32),
 		NormalTxs:     make([]NormalTxRef, 0, 512),
+		Miniblocks:    make([]MiniblockRef, 0, 32),
 		InvalidSCIDs:  make(map[string]uint64, 4),
 		BlockHashes:   make(map[int64]string, 100),
 		Installs:      make(map[string]*structures.InstallRecord, 4),
@@ -236,6 +270,17 @@ func NewWriteBatch() *WriteBatch {
 	b := batchPool.Get().(*WriteBatch)
 	b.Reset()
 	return b
+}
+
+// AddMiniblocks records the miniblocks of `blockHash` into the batch. Each
+// entry is flushed grouped under the block hash key.
+func (b *WriteBatch) AddMiniblocks(blockHash string, mbls []structures.MBLInfo) {
+	if blockHash == "" || len(mbls) == 0 {
+		return
+	}
+	for _, m := range mbls {
+		b.Miniblocks = append(b.Miniblocks, MiniblockRef{BlockHash: blockHash, MBL: m})
+	}
 }
 
 // PutWriteBatch returns a batch to the pool after Reset. Call after every
@@ -408,6 +453,7 @@ func (b *WriteBatch) Reset() {
 	clear(b.Variables)
 	clear(b.Heights)
 	b.NormalTxs = b.NormalTxs[:0]
+	b.Miniblocks = b.Miniblocks[:0]
 	clear(b.InvalidSCIDs)
 	clear(b.BlockHashes)
 	clear(b.Installs)

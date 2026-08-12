@@ -87,26 +87,45 @@ type GetInfoResult struct {
 	Status       string
 }
 
+// MBLInfo describes one miniblock of a DERO block: the miniblock's hash and,
+// when resolvable without the daemon's balance tree, its miner address.
+// Matches civilware/Gnomon's structures.MBLInfo so the compat surface can
+// return it directly. Non-final miniblocks have KeyHash pointers into the
+// daemon balance tree, which HyperGnomon cannot resolve, so their Miner is
+// left empty; the final miniblock's miner decodes from Miner_TX.MinerAddress.
+type MBLInfo struct {
+	Hash  string
+	Miner string
+}
+
 // WorkItem flows through the pipeline stages. Recycled via sync.Pool.
 type WorkItem struct {
-	Height    int64
+	Height int64
+	// BlockHash is the 64-hex block hash for Height, captured in the fetch
+	// stage (also the key under which miniblocks are stored).
+	BlockHash string
 	BlockTxns *BlockTxns
 	SCTxs     []SCTXParse
 	RegCount  int64
 	BurnCount int64
 	NormCount int64
 	NormalTxs []NormalTXWithSCIDParse
-	Err       error
+	// Miniblocks for the block at Height, harvested in the fetch stage where
+	// the full block.Block is available. Flushed via WriteBatch.AddMiniblocks.
+	Miniblocks []MBLInfo
+	Err        error
 }
 
 func (w *WorkItem) Reset() {
 	w.Height = 0
+	w.BlockHash = ""
 	w.BlockTxns = nil
 	w.SCTxs = w.SCTxs[:0]
 	w.RegCount = 0
 	w.BurnCount = 0
 	w.NormCount = 0
 	w.NormalTxs = w.NormalTxs[:0]
+	w.Miniblocks = w.Miniblocks[:0]
 	w.Err = nil
 }
 

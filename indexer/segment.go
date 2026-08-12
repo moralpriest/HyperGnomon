@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/deroproject/derohe/block"
+	"github.com/deroproject/derohe/cryptography/crypto"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
 	"github.com/sirupsen/logrus"
@@ -28,6 +29,33 @@ import (
 const DefaultSegmentSize = 10000
 
 var segLog = logrus.WithField("pkg", "segment")
+
+// miniblocksFromBlock harvests miniblock records from a decoded block. Only
+// the FINAL miniblock carries a miner resolvable without the daemon balance
+// tree: its address comes from Miner_TX.MinerAddress (a 33-byte compressed
+// pubkey, directly decodable). Non-final miniblocks have KeyHash pointers into
+// the daemon's balance tree, so their Miner stays empty — civilware resolves
+// them via its derodb graviton copy, which HyperGnomon does not have.
+func miniblocksFromBlock(bl *block.Block) []structures.MBLInfo {
+	if bl == nil || len(bl.MiniBlocks) == 0 {
+		return nil
+	}
+	out := make([]structures.MBLInfo, 0, len(bl.MiniBlocks))
+	for i := range bl.MiniBlocks {
+		mb := &bl.MiniBlocks[i]
+		m := structures.MBLInfo{Hash: mb.GetHash().String()}
+		if mb.Final {
+			var p crypto.Point
+			if err := p.DecodeCompressed(bl.Miner_TX.MinerAddress[:]); err != nil {
+				segLog.Debugf("miniblock %s final miner decode: %v", m.Hash, err)
+			} else {
+				m.Miner = rpc.NewAddressFromKeys(&p).String()
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
 
 // segment represents a contiguous range of blocks to process.
 type segment struct {
@@ -261,6 +289,8 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 					mu.Unlock()
 					return
 				}
+				wi.BlockHash = hash
+				wi.Miniblocks = miniblocksFromBlock(&bl)
 
 				bt := hgpool.GetBlockTxns()
 				bt.Topoheight = int64(bl.Height) // #nosec G115 -- DERO chain heights are 0..2^62, far below the conversion bound.
@@ -295,6 +325,7 @@ func (ss *SegmentSync) processSegment(client *hgrpc.Client, seg segment, dbPath 
 			if wi.BlockTxns != nil && len(wi.BlockTxns.TxHashes) > 0 {
 				ss.processBlockTxns(client, wi, batch, validatedSCs)
 			}
+			batch.AddMiniblocks(wi.BlockHash, wi.Miniblocks)
 
 			if wi.BlockTxns != nil {
 				hgpool.PutBlockTxns(wi.BlockTxns)

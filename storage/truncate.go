@@ -205,6 +205,15 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		// ---- Step 2: delete height-keyed detail > h ----
 
 		// blockhashes + installs: BE8-height-prefixed, so seek + delete to end.
+		// Collect the removed block hashes first so the height-derived miniblock
+		// records (keyed by block hash, not height) can be removed in lockstep.
+		var mblToDel [][]byte
+		if bh := tx.Bucket(bucketBlockHash); bh != nil {
+			c := bh.Cursor()
+			for k, v := c.Seek(encHeight(h + 1)); k != nil; k, v = c.Next() {
+				mblToDel = append(mblToDel, v)
+			}
+		}
 		if err := deleteFromSeek(tx.Bucket(bucketBlockHash), encHeight(h+1)); err != nil {
 			return err
 		}
@@ -249,6 +258,31 @@ func (s *BboltStore) TruncateToHeight(h int64) error {
 		if nb := tx.Bucket(bucketNormTx); nb != nil {
 			for _, k := range normTxToDel {
 				if err := nb.Delete(k); err != nil {
+					return err
+				}
+			}
+		}
+
+		// normaltxwithscid_scid: same record set as normaltxwithscid, keyed by
+		// scid. Delete the matching keys (> h data only).
+		if snb := tx.Bucket(bucketNormTxSCID); snb != nil && len(normTxToDel) > 0 {
+			delKeys := make([][]byte, 0, len(normTxToDel))
+			for _, k := range normTxToDel {
+				if inv, ok := normTxKeyToSCIDKey(k); ok {
+					delKeys = append(delKeys, inv)
+				}
+			}
+			for _, k := range delKeys {
+				if err := snb.Delete(k); err != nil {
+					return err
+				}
+			}
+		}
+
+		// miniblocks: keyed by block hash; delete the hashes removed above.
+		if mbB := tx.Bucket(bucketMBL); mbB != nil {
+			for _, blid := range mblToDel {
+				if err := mbB.Delete(blid); err != nil {
 					return err
 				}
 			}
@@ -596,6 +630,28 @@ func splitNormTxKey(k []byte) (addr, scid []byte, height int64, ok bool) {
 		return nil, nil, 0, false
 	}
 	return k[:sep], k[last+1:], decHeight(k[sep+1 : sep+9]), true
+}
+
+// normTxKeyToSCIDKey maps a "<addr>:<BE8 h>:<txid>:<scid>" normaltxwithscid
+// key to its inverse "<scid>|<addr>:<BE8 h>:<txid>" bucketNormTxSCID form.
+// Same right-anchored, BE8-colon-tolerant parsing as splitNormTxKey. Returns
+// ok=false for scid-less composite or legacy blob keys.
+func normTxKeyToSCIDKey(k []byte) ([]byte, bool) {
+	sep := bytes.IndexByte(k, ':')
+	if sep < 0 || len(k) <= sep+9 || k[sep+9] != ':' {
+		return nil, false
+	}
+	last := bytes.LastIndexByte(k, ':')
+	if last < sep+10 || len(k)-last-1 != 64 {
+		return nil, false
+	}
+	out := make([]byte, 0, len(k)+1)
+	out = append(out, k[last+1:]...) // scid
+	out = append(out, '|')
+	out = append(out, k[:sep]...) // addr
+	out = append(out, ':')
+	out = append(out, k[sep+1:last]...) // BE8 h ':' txid
+	return out, true
 }
 
 // mergeAddrTouch folds one (addr, scid, height) interaction into the survivors

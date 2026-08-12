@@ -3,6 +3,7 @@ package indexer
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -235,6 +236,25 @@ func (idx *Indexer) StartDaemonMode() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// Sparse-history daemons (e.g. fastsync before backfill completes) cannot
+	// serve the earliest topo heights. Find the first block the daemon can
+	// return and jump the scan there, so we index everything it actually has
+	// instead of retrying the missing region forever.
+	var firstAvailable int64
+	probeErr := idx.RPCPool.WithConn(func(c *hgrpc.Client) error {
+		fa, err := c.FirstAvailableTopo(uint64(idx.ChainHeight.Load()))
+		if err != nil {
+			return err
+		}
+		firstAvailable = fa
+		return nil
+	})
+	if probeErr == nil && firstAvailable > idx.LastIndexedHeight.Load() {
+		idx.LastIndexedHeight.Store(firstAvailable - 1)
+		logger.Warnf("Daemon history sparse: first available topoheight=%d (chain=%d); starting scan there",
+			firstAvailable, idx.ChainHeight.Load())
+	}
+
 	// Quick-scan: start from chain tip - N blocks instead of genesis
 	if idx.RecentBlocks > 0 {
 		skipTo := idx.ChainHeight.Load() - idx.RecentBlocks
@@ -275,6 +295,14 @@ func (idx *Indexer) monitorChainHeight() {
 			newHeight := info.TopoHeight
 			oldHeight := idx.ChainHeight.Load()
 			idx.ChainHeight.Store(newHeight)
+
+			// Persist the GetInfo snapshot for the civilware GetGetInfoDetails
+			// surface. Best-effort: a write failure must not disrupt polling.
+			if idx.Store != nil {
+				if err := idx.Store.StoreGetInfo(info); err != nil {
+					logger.Debugf("store getinfo snapshot: %v", err)
+				}
+			}
 
 			// Throttle tela_cache height rewrites: full-file rewrite every block
 			// is gratuitous I/O when the only change is the Height field.
@@ -404,6 +432,9 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 	// LastIndexedHeight atomic (which is now only advanced by the flusher on
 	// successful commit). Reorg detection & restart still read the atomic.
 	nextHeight := idx.LastIndexedHeight.Load()
+	// consecutiveSparseSkips bounds how many missing ranges we skip past, so a
+	// pathological daemon can't make the fetcher spin across the whole chain.
+	consecutiveSparseSkips := 0
 
 	for !idx.Closing.Load() {
 		lastHeight := nextHeight
@@ -461,9 +492,22 @@ func (idx *Indexer) fetcherLoop(out chan<- *fetchedBatch) {
 		idx.timer.record(stageFetchBlocksRPC, time.Since(tBlocks))
 		if err != nil {
 			logger.Errorf("BatchGetBlocks at %d: %v", lastHeight+1, err)
+			if errors.Is(err, hgrpc.ErrBlocksMissing) && consecutiveSparseSkips < 5 {
+				// Sparse daemon: the whole requested range doesn't exist yet
+				// (fastsync node still backfilling). Skip past it so the scan
+				// keeps making progress instead of stalling on missing history.
+				consecutiveSparseSkips++
+				nextHeight += int64(len(heights))
+				logger.Warnf("Skipping missing block range %d..%d (sparse daemon history, skip %d/5); next=%d",
+					heights[0], heights[len(heights)-1], consecutiveSparseSkips, nextHeight+1)
+				continue
+			}
 			time.Sleep(1 * time.Second)
 			continue
 		}
+
+		// A clean batch means the sparse region (if any) is behind us.
+		consecutiveSparseSkips = 0
 
 		// Parse blocks and collect all TX hashes
 		blocks := make([]blockInfo, 0, fetchCount)

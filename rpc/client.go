@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -154,6 +155,47 @@ func (c *Client) GetBlock(hash string) (*rpc.GetBlock_Result, error) {
 	return &result, nil
 }
 
+// ErrBlocksMissing reports a batch in which every requested height was served
+// as "empty block" — the daemon is sparse (e.g. a fastsync node still
+// backfilling) and does not have that history yet. Callers may skip past the
+// missing range instead of retrying it forever.
+var ErrBlocksMissing = errors.New("batch blocks missing (empty block)")
+
+// FirstAvailableTopo finds the lowest topoheight the daemon can serve.
+// Fully-synced daemons answer every height and this returns 0. Sparse
+// daemons (fastsync mid-backfill) return empty-block errors for the earliest
+// heights, so this binary-searches [0, tip] for the first height that answers.
+// Only "empty block" errors are treated as unavailable — any other RPC
+// failure (e.g. unreachable daemon) aborts the probe so callers never skip
+// valid history based on a transient error.
+func (c *Client) FirstAvailableTopo(tip uint64) (int64, error) {
+	isMissing := func(err error) bool {
+		return err != nil && strings.Contains(strings.ToLower(err.Error()), "empty block")
+	}
+
+	if _, err := c.GetBlockHeaderByTopoHeight(0); err == nil {
+		return 0, nil
+	} else if !isMissing(err) {
+		return 0, err
+	}
+	if tip <= 1 {
+		return int64(tip), nil
+	}
+
+	lo, hi := uint64(1), tip // lo unavailable, hi available
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if _, err := c.GetBlockHeaderByTopoHeight(mid); err == nil {
+			hi = mid
+		} else if isMissing(err) {
+			lo = mid + 1
+		} else {
+			return 0, err
+		}
+	}
+	return int64(lo), nil
+}
+
 // GetBlockHeaderByTopoHeight retrieves a block header by topoheight.
 func (c *Client) GetBlockHeaderByTopoHeight(height uint64) (*rpc.GetBlockHeaderByHeight_Result, error) {
 	c.mu.RLock()
@@ -269,16 +311,23 @@ func (c *Client) BatchGetBlocks(heights []uint64) ([]*rpc.GetBlock_Result, error
 	// the other 49. Callers already handle nil entries (fetcherLoop skips them).
 	results := make([]*rpc.GetBlock_Result, len(responses))
 	failures := 0
+	missing := 0
 	for i, resp := range responses {
 		var result rpc.GetBlock_Result
 		if err := resp.UnmarshalResult(&result); err != nil {
 			logger.Warnf("BatchGetBlocks: skipping height %d: %v", heights[i], err)
 			failures++
+			if strings.Contains(strings.ToLower(err.Error()), "empty block") {
+				missing++
+			}
 			continue
 		}
 		results[i] = &result
 	}
 	if failures == len(responses) {
+		if missing == len(responses) {
+			return results, fmt.Errorf("%w (heights %d..%d)", ErrBlocksMissing, heights[0], heights[len(heights)-1])
+		}
 		return results, fmt.Errorf("BatchGetBlocks: all %d responses failed to unmarshal", len(responses))
 	}
 	return results, nil

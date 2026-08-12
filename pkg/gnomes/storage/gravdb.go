@@ -128,3 +128,139 @@ func (g *GravitonStore) GetOwner(scid string) string {
 	}
 	return ""
 }
+
+// GetTxCount delegates to bbolt or returns 0.
+func (g *GravitonStore) GetTxCount(txType string) int64 {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetTxCount(txType)
+	}
+	return 0
+}
+
+// GetAllNormalTxWithSCIDByAddr delegates to bbolt or returns nil.
+func (g *GravitonStore) GetAllNormalTxWithSCIDByAddr(addr string) []*compatstructures.NormalTXWithSCIDParse {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllNormalTxWithSCIDByAddr(addr)
+	}
+	return nil
+}
+
+// GetAllNormalTxWithSCIDBySCID delegates to bbolt or returns nil.
+func (g *GravitonStore) GetAllNormalTxWithSCIDBySCID(scid string) []*compatstructures.NormalTXWithSCIDParse {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllNormalTxWithSCIDBySCID(scid)
+	}
+	return nil
+}
+
+// GetAllSCIDInvokeDetails delegates to bbolt or returns nil.
+func (g *GravitonStore) GetAllSCIDInvokeDetails(scid string) []*compatstructures.SCTXParse {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllSCIDInvokeDetails(scid)
+	}
+	return nil
+}
+
+// GetAllSCIDInvokeDetailsByEntrypoint delegates to bbolt or returns nil.
+func (g *GravitonStore) GetAllSCIDInvokeDetailsByEntrypoint(scid, entrypoint string) []*compatstructures.SCTXParse {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllSCIDInvokeDetailsByEntrypoint(scid, entrypoint)
+	}
+	return nil
+}
+
+// GetAllSCIDInvokeDetailsBySigner delegates to bbolt or returns nil.
+func (g *GravitonStore) GetAllSCIDInvokeDetailsBySigner(scid, signer string) []*compatstructures.SCTXParse {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllSCIDInvokeDetailsBySigner(scid, signer)
+	}
+	return nil
+}
+
+// GetGetInfoDetails delegates to bbolt or returns nil.
+func (g *GravitonStore) GetGetInfoDetails() *compatstructures.GetInfo {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetGetInfoDetails()
+	}
+	return nil
+}
+
+// GetSCIDVariableDetailsAtTopoheight delegates to bbolt or returns nil.
+func (g *GravitonStore) GetSCIDVariableDetailsAtTopoheight(scid string, topoheight int64) []*compatstructures.SCIDVariable {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetSCIDVariableDetailsAtTopoheight(scid, topoheight)
+	}
+	return nil
+}
+
+// GetInteractionIndex delegates to bbolt or returns 0.
+func (g *GravitonStore) GetInteractionIndex(topoheight int64, heights []int64, rmax bool) int64 {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetInteractionIndex(topoheight, heights, rmax)
+	}
+	return 0
+}
+
+// GetInvalidSCIDDeploys delegates to bbolt or returns an empty map.
+func (g *GravitonStore) GetInvalidSCIDDeploys() map[string]uint64 {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetInvalidSCIDDeploys()
+	}
+	return map[string]uint64{}
+}
+
+// GetAllMiniblockDetails delegates to bbolt or returns an empty map.
+func (g *GravitonStore) GetAllMiniblockDetails() map[string][]*compatstructures.MBLInfo {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllMiniblockDetails()
+	}
+	return map[string][]*compatstructures.MBLInfo{}
+}
+
+// GetMiniblockDetailsByHash delegates to bbolt or returns nil.
+func (g *GravitonStore) GetMiniblockDetailsByHash(blid string) []*compatstructures.MBLInfo {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetMiniblockDetailsByHash(blid)
+	}
+	return nil
+}
+
+// GetMiniblockCountByAddress delegates to bbolt or returns 0.
+func (g *GravitonStore) GetMiniblockCountByAddress(addr string) int64 {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetMiniblockCountByAddress(addr)
+	}
+	return 0
+}
+
+// GetSCIDInteractionByAddr delegates to bbolt or returns nil.
+func (g *GravitonStore) GetSCIDInteractionByAddr(addr string) []string {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetSCIDInteractionByAddr(addr)
+	}
+	return nil
+}
+
+// StoreTelaCandidate delegates to bbolt or returns nil.
+func (g *GravitonStore) StoreTelaCandidate(scid string, status string) error {
+	if g != nil && g.bolt != nil {
+		return g.bolt.StoreTelaCandidate(scid, status)
+	}
+	return nil
+}
+
+// GetTelaCandidate delegates to bbolt or returns "".
+func (g *GravitonStore) GetTelaCandidate(scid string) string {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetTelaCandidate(scid)
+	}
+	return ""
+}
+
+// GetAllTelaCandidates delegates to bbolt or returns an empty map.
+func (g *GravitonStore) GetAllTelaCandidates() map[string]string {
+	if g != nil && g.bolt != nil {
+		return g.bolt.GetAllTelaCandidates()
+	}
+	return map[string]string{}
+}

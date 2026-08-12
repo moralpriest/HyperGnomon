@@ -1082,6 +1082,56 @@ func saveTELACache(dbDir string, indexSCIDs, docSCIDs []string, otherClasses map
 	return nil
 }
 
+// TELACachedSCIDs returns the TELA INDEX + DOC SCIDs recorded in the on-disk
+// tela_cache.bin (nil when missing/unreadable). This is the same cache the
+// FastSync cache-fresh path uses; exposing it lets the compat shim seed the
+// civilware telacandidates bucket after a probe settles, so consumers like
+// Engram can take the pre-computed-candidates fast path instead of running
+// their own multi-thousand-SCID prefilter on the first click.
+func (idx *Indexer) TELACachedSCIDs() []string {
+	if idx == nil {
+		return nil
+	}
+	cached, err := loadTELACache(idx.DBDir)
+	if err != nil || cached == nil {
+		return nil
+	}
+	out := make([]string, 0, len(cached.IndexSCIDs)+len(cached.DocSCIDs))
+	out = append(out, cached.IndexSCIDs...)
+	out = append(out, cached.DocSCIDs...)
+	return out
+}
+
+// TELAIndexSCIDs returns only the TELA INDEX (app) SCIDs recorded in the
+// on-disk tela_cache.bin. INDEX contracts are the actual TELA apps users see
+// in Engram; DOC contracts are each app's documentation and must not be
+// surfaced as app candidates. Separate accessors let the compat shim seed the
+// civilware telacandidates bucket with exactly the right classification.
+func (idx *Indexer) TELAIndexSCIDs() []string {
+	if idx == nil {
+		return nil
+	}
+	cached, err := loadTELACache(idx.DBDir)
+	if err != nil || cached == nil {
+		return nil
+	}
+	return cached.IndexSCIDs
+}
+
+// TELADocSCIDs returns only the TELA DOC (documentation) SCIDs recorded in the
+// on-disk tela_cache.bin. These are supporting contracts, not apps; the compat
+// shim records them with a "doc" status so they never surface as candidates.
+func (idx *Indexer) TELADocSCIDs() []string {
+	if idx == nil {
+		return nil
+	}
+	cached, err := loadTELACache(idx.DBDir)
+	if err != nil || cached == nil {
+		return nil
+	}
+	return cached.DocSCIDs
+}
+
 // cachedScvarsLookReadable samples cached TELA INDEX SCIDs and checks
 // whether their variable snapshots decode AND contain the shape we
 // expect for a TELA INDEX (at least one "dero1q…" rating-address key).

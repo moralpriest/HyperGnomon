@@ -14,17 +14,47 @@ import (
 	"github.com/hypergnomon/hypergnomon/structures"
 )
 
-// telaRefreshInterval is how often the refresher re-fetches variable
-// snapshots for every TELA INDEX in the class bucket. 60s is a compromise
-// between rating freshness in the Browser (users expect sub-minute
-// feedback after they rate or update an app) and daemon load (~90 GetSC
-// calls per minute is ~2/s, well inside a healthy node's headroom).
+// telaRefreshInterval is the base cadence of the TELA variable refresher.
+// 60s is a compromise between rating freshness in the Browser (users expect
+// sub-minute feedback after they rate or update an app) and daemon load
+// (~90 GetSC calls per minute is ~2/s, well inside a healthy node's
+// headroom).
 const telaRefreshInterval = 60 * time.Second
+
+// telaRefreshMaxBackoff caps the refresher's exponential backoff when the
+// node is overloaded or unreachable. Once a cycle fails more than
+// refreshOverloadThreshold of its SCIDs we stop hammering the node and poll
+// at most this often until it recovers.
+const telaRefreshMaxBackoff = 10 * time.Minute
 
 // telaRefreshBatch is the chunk size for the RPC batch call. Mirrors
 // the phase-2 probe's batch size so we reuse the same per-connection
 // characteristics the probe already tuned.
 const telaRefreshBatch = 25
+
+// telaRefreshBatchTimeout bounds each batch RPC call. A healthy node answers
+// a 25-SCID batch in well under a second (observed ~800ms for the whole
+// 114-app set), so 20s is generous headroom while keeping a hung node from
+// pinning the refresher for a full minute.
+const telaRefreshBatchTimeout = 20 * time.Second
+
+// refreshOverloadThreshold: when the fraction of SCIDs that failed a refresh
+// cycle exceeds this, the node is considered overloaded and the refresher
+// backs off.
+const refreshOverloadThreshold = 0.5
+
+// classRefreshStats reports the outcome of one RefreshClassVars cycle:
+// how many SCIDs were persisted, how many were attempted, and how the
+// failures break down between per-item RPC errors and genuine decode
+// errors. overloaded is true when the failure ratio exceeded
+// refreshOverloadThreshold.
+type classRefreshStats struct {
+	persisted    int
+	total        int
+	scidErrors   int64
+	decodeErrors int64
+	overloaded   bool
+}
 
 // startTELARefresher launches a goroutine that periodically re-fetches
 // variable snapshots for every SCID in the TELA-INDEX-1 class bucket.
@@ -34,6 +64,11 @@ const telaRefreshBatch = 25
 // goroutine closes that staleness window without changing the scan's
 // hot path.
 //
+// The tick interval is adaptive: a cycle with >refreshOverloadThreshold
+// failures (overloaded node, RPC outage, etc.) doubles the interval up to
+// telaRefreshMaxBackoff so we stop adding load to a struggling node, and a
+// clean cycle resets to the base interval.
+//
 // Cheap to call — no-op if the class bucket is empty. Exits on
 // idx.Closing.
 func (idx *Indexer) startTELARefresher() {
@@ -41,27 +76,44 @@ func (idx *Indexer) startTELARefresher() {
 		// Stagger the first tick so the probe that ran moments before
 		// us doesn't contend with our refresh. The probe already wrote
 		// fresh data — our first meaningful refresh can wait a minute.
-		ticker := time.NewTicker(telaRefreshInterval)
-		defer ticker.Stop()
-		for range ticker.C {
+		interval := telaRefreshInterval
+		for {
+			time.Sleep(interval)
 			if idx.Closing.Load() {
 				return
 			}
-			n, err := idx.RefreshTELAVars()
+			stats, err := idx.refreshTELAVarsStats()
 			if err != nil {
 				logger.Debugf("TELA refresh: %v", err)
-			} else if n > 0 {
-				logger.Debugf("TELA refresh: refreshed %d apps", n)
+			} else if stats.persisted > 0 {
+				logger.Debugf("TELA refresh: refreshed %d apps", stats.persisted)
+			}
+			if stats.overloaded {
+				interval *= 2
+				if interval > telaRefreshMaxBackoff {
+					interval = telaRefreshMaxBackoff
+				}
+				logger.Warnf("TELA refresh: node overloaded (%d/%d SCIDs failed), backing off to %s",
+					stats.scidErrors+stats.decodeErrors, stats.total, interval)
+			} else {
+				interval = telaRefreshInterval
 			}
 		}
 	}()
 }
 
 // RefreshTELAVars is a convenience shim that refreshes TELA-INDEX-1
-// apps. Kept for the existing 60s background loop and HOLOGRAM's
+// apps. Kept for the existing background loop and HOLOGRAM's
 // RefreshBrowserApps Wails method.
 func (idx *Indexer) RefreshTELAVars() (int, error) {
-	return idx.RefreshClassVars("TELA-INDEX-1")
+	stats, err := idx.refreshTELAVarsStats()
+	return stats.persisted, err
+}
+
+// refreshTELAVarsStats is the internal stats variant of RefreshTELAVars,
+// used by the background loop so it can detect node overload and back off.
+func (idx *Indexer) refreshTELAVarsStats() (classRefreshStats, error) {
+	return idx.refreshClassVarsStats("TELA-INDEX-1")
 }
 
 // RefreshClassVars fetches current variables for every SCID in the named
@@ -83,39 +135,51 @@ func (idx *Indexer) RefreshTELAVars() (int, error) {
 // reader/writer isolation. Touches scvars + classIdx + the class bucket
 // (updates ClassMeta.Name/Desc/Icon from the freshly-fetched vars).
 func (idx *Indexer) RefreshClassVars(class string) (int, error) {
+	stats, err := idx.refreshClassVarsStats(class)
+	return stats.persisted, err
+}
+
+// refreshClassVarsStats is the internal implementation of RefreshClassVars.
+// It returns detailed stats (persisted/total + error breakdown + overload
+// flag) instead of just the persisted count, so callers like the TELA
+// refresher loop can adapt to a struggling node. The public RefreshClassVars
+// wraps it and keeps the historical (int, error) signature.
+func (idx *Indexer) refreshClassVarsStats(class string) (classRefreshStats, error) {
+	var stats classRefreshStats
 	if idx == nil || idx.Store == nil || idx.RPCPool == nil {
-		return 0, nil
+		return stats, nil
 	}
 	if idx.Closing.Load() {
-		return 0, nil
+		return stats, nil
 	}
 	if class == "" {
-		return 0, nil
+		return stats, nil
 	}
 
 	installs, err := idx.Store.GetClassInstalls(class, 0)
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
 	if len(installs) == 0 {
-		return 0, nil
+		return stats, nil
 	}
 
 	chainHeight := idx.ChainHeight.Load()
 	if chainHeight == 0 {
-		return 0, nil
+		return stats, nil
 	}
 
 	scids := make([]string, 0, len(installs))
 	for _, inst := range installs {
 		scids = append(scids, inst.SCID)
 	}
+	stats.total = len(scids)
 
 	start := time.Now()
 	batch := storage.NewWriteBatch()
 	var batchMu sync.Mutex
 	persisted := 0
-	var rpcErrors atomic.Int64
+	var scidErrors atomic.Int64
 	var decodeErrors atomic.Int64
 
 	workChan := make(chan []string, 8)
@@ -153,7 +217,7 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 								Params: buildGetSCParams(scid, fastKeys),
 							}
 						}
-						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						ctx, cancel := context.WithTimeout(context.Background(), telaRefreshBatchTimeout)
 						defer cancel()
 
 						results, err := c.RPC.Batch(ctx, specs)
@@ -162,6 +226,19 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 						}
 
 						for i, resp := range results {
+							if i >= len(chunk) {
+								continue // defensive: never index past the chunk
+							}
+							// A per-item error response (daemon overloaded,
+							// SCID gone, rate-limited, etc.) is an RPC-level
+							// failure — NOT a decode failure. Check it first
+							// so the counters tell the truth about what went
+							// wrong instead of lumping everything into
+							// decode_errors.
+							if resp.Error() != nil {
+								scidErrors.Add(1)
+								continue
+							}
 							var r rpc.GetSC_Result
 							if err := resp.UnmarshalResult(&r); err != nil {
 								decodeErrors.Add(1)
@@ -195,7 +272,9 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 				}
 				if lastErr != nil {
-					rpcErrors.Add(1)
+					// The whole chunk's transport failed on both attempts:
+					// count every SCID in the chunk as failed.
+					scidErrors.Add(int64(len(chunk)))
 				}
 			}
 		}()
@@ -211,10 +290,16 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 	close(workChan)
 	wg.Wait()
 
+	stats.persisted = persisted
+	stats.scidErrors = scidErrors.Load()
+	stats.decodeErrors = decodeErrors.Load()
+	stats.overloaded = stats.total > 0 &&
+		float64(stats.scidErrors+stats.decodeErrors)/float64(stats.total) > refreshOverloadThreshold
+
 	if persisted > 0 {
 		if err := idx.Store.FlushBatch(batch); err != nil {
 			storage.PutWriteBatch(batch)
-			return 0, err
+			return stats, err
 		}
 	}
 	storage.PutWriteBatch(batch)
@@ -223,10 +308,11 @@ func (idx *Indexer) RefreshClassVars(class string) (int, error) {
 	if fastKeys != nil {
 		mode = "fast"
 	}
-	logger.Infof("Class refresh %s (%s): %d apps persisted at height %d in %s",
-		class, mode, persisted, chainHeight, time.Since(start).Round(time.Millisecond))
-	if rpcErrors.Load() > 0 || decodeErrors.Load() > 0 {
-		logger.Warnf("Class refresh %s (%s): rpc_errors=%d decode_errors=%d", class, mode, rpcErrors.Load(), decodeErrors.Load())
+	logger.Infof("Class refresh %s (%s): %d/%d apps persisted at height %d in %s",
+		class, mode, persisted, stats.total, chainHeight, time.Since(start).Round(time.Millisecond))
+	if stats.scidErrors > 0 || stats.decodeErrors > 0 {
+		logger.Warnf("Class refresh %s (%s): rpc_scid_errors=%d decode_errors=%d (overloaded=%v)",
+			class, mode, stats.scidErrors, stats.decodeErrors, stats.overloaded)
 	}
-	return persisted, nil
+	return stats, nil
 }

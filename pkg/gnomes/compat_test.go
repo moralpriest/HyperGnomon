@@ -101,7 +101,7 @@ func TestCompatSurface_CompilesLikeCivilware(t *testing.T) {
 	_ = (*compatstorage.GravitonStore)(nil)
 	_ = compatstorage.NewBBoltDB
 	_ = compatstorage.NewGravDB
-	_ = compatstorage.ErrGravDBNotSupported
+	_ = compatstorage.ErrGravDBNotSupported //nolint:staticcheck // kept deliberately: this test proves the compat symbol still exists
 }
 
 // TestNewGravDB_WarnFallback confirms NewGravDB no longer errors: a civilware

@@ -2161,6 +2161,9 @@ func (s *BboltStore) GetMiniblockCountByAddress(addr string) (int64, error) {
 		return b.ForEach(func(k, v []byte) error {
 			var mbls []*structures.MBLInfo
 			if err := msgpack.Unmarshal(v, &mbls); err != nil {
+				// Corrupt record — skip it like the other decode paths; one
+				// bad blob must not abort the whole count scan.
+				logger.Warnf("miniblock decode %s: %v (skipping)", k, err)
 				return nil
 			}
 			for _, m := range mbls {

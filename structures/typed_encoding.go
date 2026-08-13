@@ -519,45 +519,12 @@ func appendVarField(dst []byte, v interface{}) []byte {
 	return dst
 }
 
-func readVarField(b []byte, pos int) (interface{}, int, error) {
-	if pos >= len(b) {
-		return nil, pos, ErrInvalidSCIDVariables
-	}
-	kind := b[pos]
-	pos++
-	switch kind {
-	case varKindString:
-		n, nLen := binary.Uvarint(b[pos:])
-		if nLen <= 0 {
-			return nil, pos, ErrInvalidSCIDVariables
-		}
-		pos += nLen
-		remaining := uint64(len(b) - pos) // #nosec G115 -- pos is bounded by prior slice and varint checks.
-		if n > remaining {
-			return nil, pos, ErrInvalidSCIDVariables
-		}
-		end := pos + int(n) // #nosec G115 -- bounded by len(b)-pos above.
-		if end > len(b) {
-			return nil, pos, ErrInvalidSCIDVariables
-		}
-		s := string(b[pos:end])
-		return s, end, nil
-	case varKindUint64:
-		if pos+8 > len(b) {
-			return nil, pos, ErrInvalidSCIDVariables
-		}
-		u := binary.BigEndian.Uint64(b[pos : pos+8])
-		return u, pos + 8, nil
-	default:
-		return nil, pos, ErrInvalidSCIDVariables
-	}
-}
-
 // locVarField parses one typed SCIDVariable field at pos WITHOUT allocating.
 // For a string field it returns kind=varKindString and the [start,end) byte
 // range; for a uint64 field it returns kind=varKindUint64 and the value u.
-// next is the position after the field. Wire parsing mirrors readVarField so
-// the coalescing decoder stays in lockstep with the per-field decoder.
+// next is the position after the field. Wire parsing mirrors the append
+// encoder (appendVarField) so the coalescing decoder stays in lockstep with
+// the per-field decoder.
 func locVarField(b []byte, pos int) (kind byte, start, end int, u uint64, next int, err error) {
 	if pos >= len(b) {
 		return 0, 0, 0, 0, pos, ErrInvalidSCIDVariables

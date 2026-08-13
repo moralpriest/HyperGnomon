@@ -60,7 +60,7 @@ func ValidateStore(dbDir string, lockTimeout time.Duration) error {
 	})
 	if err != nil {
 		if errors.Is(err, gitbbolt.ErrTimeout) {
-			return fmt.Errorf("%w: %v", ErrStoreInUse, err)
+			return fmt.Errorf("%w: %w", ErrStoreInUse, err)
 		}
 		return fmt.Errorf("[ValidateStore] open %s: %w", dbPath, err)
 	}
@@ -487,7 +487,7 @@ func (b *BboltStore) StoreTelaCandidate(scid string, status string) error {
 	return b.DB.Update(func(tx *gitbbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(telaCandidateBucket))
 		if err != nil {
-			return fmt.Errorf("bucket: %s", err)
+			return fmt.Errorf("bucket: %w", err)
 		}
 		return bucket.Put([]byte(scid), []byte(status))
 	})

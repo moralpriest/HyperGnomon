@@ -56,6 +56,40 @@ type classRefreshStats struct {
 	overloaded   bool
 }
 
+// classifyRefreshResponse classifies a single jrpc2 batch response from a
+// refresh cycle. It returns three flags: whether the response carried a
+// per-item RPC error (daemon overloaded, SCID gone, rate-limited, etc.),
+// whether the result failed to unmarshal into GetSC_Result, and the
+// extracted variables when neither failure occurred.
+//
+// The scidErr/decodeErr split exists so node-overload errors are reported
+// truthfully instead of being lumped into decode_errors: an RPC error
+// response (resp.Error() != nil) is a daemon-side failure, while a decode
+// error means the daemon answered with a result we could not parse.
+func classifyRefreshResponse(resp *jrpc2.Response, fastKeys []string) (scidErr, decodeErr bool, vars []*structures.SCIDVariable) {
+	if resp.Error() != nil {
+		return true, false, nil
+	}
+	var r rpc.GetSC_Result
+	if err := resp.UnmarshalResult(&r); err != nil {
+		return false, true, nil
+	}
+	if fastKeys != nil {
+		vars = scVarsFromKeyValues(fastKeys, r.ValuesString)
+	} else {
+		vars = parseSCVariables(&r)
+	}
+	return false, false, vars
+}
+
+// isRefreshOverloaded reports whether the fraction of SCIDs that failed a
+// refresh cycle exceeds refreshOverloadThreshold, treating the node as
+// overloaded so the refresher can back off.
+func isRefreshOverloaded(total int, scidErrors, decodeErrors int64) bool {
+	return total > 0 &&
+		float64(scidErrors+decodeErrors)/float64(total) > refreshOverloadThreshold
+}
+
 // startTELARefresher launches a goroutine that periodically re-fetches
 // variable snapshots for every SCID in the TELA-INDEX-1 class bucket.
 // Rationale: HOLOGRAM defaults HG to TurboMode, which skips GetSC on
@@ -229,28 +263,15 @@ func (idx *Indexer) refreshClassVarsStats(class string) (classRefreshStats, erro
 							if i >= len(chunk) {
 								continue // defensive: never index past the chunk
 							}
-							// A per-item error response (daemon overloaded,
-							// SCID gone, rate-limited, etc.) is an RPC-level
-							// failure — NOT a decode failure. Check it first
-							// so the counters tell the truth about what went
-							// wrong instead of lumping everything into
-							// decode_errors.
-							if resp.Error() != nil {
+							scidErr, decodeErr, vars := classifyRefreshResponse(resp, fastKeys)
+							switch {
+							case scidErr:
 								scidErrors.Add(1)
 								continue
-							}
-							var r rpc.GetSC_Result
-							if err := resp.UnmarshalResult(&r); err != nil {
+							case decodeErr:
 								decodeErrors.Add(1)
 								continue
-							}
-							var vars []*structures.SCIDVariable
-							if fastKeys != nil {
-								vars = scVarsFromKeyValues(fastKeys, r.ValuesString)
-							} else {
-								vars = parseSCVariables(&r)
-							}
-							if len(vars) == 0 {
+							case len(vars) == 0:
 								continue
 							}
 							// Single-pass: class comes from the class bucket we're
@@ -293,8 +314,7 @@ func (idx *Indexer) refreshClassVarsStats(class string) (classRefreshStats, erro
 	stats.persisted = persisted
 	stats.scidErrors = scidErrors.Load()
 	stats.decodeErrors = decodeErrors.Load()
-	stats.overloaded = stats.total > 0 &&
-		float64(stats.scidErrors+stats.decodeErrors)/float64(stats.total) > refreshOverloadThreshold
+	stats.overloaded = isRefreshOverloaded(stats.total, stats.scidErrors, stats.decodeErrors)
 
 	if persisted > 0 {
 		if err := idx.Store.FlushBatch(batch); err != nil {

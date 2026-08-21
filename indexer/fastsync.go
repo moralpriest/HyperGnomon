@@ -596,7 +596,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 					}
 					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 				}
-				if lastErr != nil {
+				if lastErr != nil && !idx.Closing.Load() {
 					phase2RPCErrors.Add(1)
 					logger.Warnf("Classify phase 2 batch failed after retry (%s, %d SCIDs): %v", item.class, len(item.scids), lastErr)
 				}
@@ -750,7 +750,7 @@ func (idx *Indexer) probeTELA(candidates []*registryEntry, chainHeight int64, al
 					}
 					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 				}
-				if lastErr != nil {
+				if lastErr != nil && !idx.Closing.Load() && !probeComplete.Load() {
 					phase1RPCErrors.Add(1)
 					logger.Warnf("Classify phase 1 batch failed after retry (%d SCIDs): %v", len(batch), lastErr)
 				}

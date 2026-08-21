@@ -317,7 +317,7 @@ func (idx *Indexer) monitorChainHeight() {
 			}
 			return nil
 		})
-		if err != nil {
+		if err != nil && !idx.Closing.Load() {
 			logger.Errorf("getInfo: %v", err)
 		}
 		// Adaptive polling: fast when caught up, slow during sync to reduce daemon load

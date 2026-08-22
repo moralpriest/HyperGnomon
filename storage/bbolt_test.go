@@ -697,3 +697,68 @@ func BenchmarkBatchAlloc(b *testing.B) {
 		}
 	})
 }
+
+// TestGetSCIDVariableDetailsAtHeight_LatestOnZero pins the civilware compat
+// contract: GetSCIDVariableDetailsAtHeight(scid, 0) must return the LATEST
+// snapshot, not nil. pkg/gnomes/storage.GetAllSCIDVariableDetails passes 0
+// verbatim ("0 means latest"), but the reader used to reject height <= 0,
+// so every XSWD Gnomon.GetAllSCIDVariableDetails query returned empty on
+// freshly indexed contracts (e.g. DeroBeats' song registry via Engram's
+// AutoIndexDependentSCIDs).
+func TestGetSCIDVariableDetailsAtHeight_LatestOnZero(t *testing.T) {
+	store := openTestStore(t)
+	scid := fakeSCID()
+
+	v100 := []*structures.SCIDVariable{{Key: "song", Value: "old"}}
+	v200 := []*structures.SCIDVariable{
+		{Key: "song", Value: "new"},
+		{Key: "count", Value: uint64(2)},
+	}
+	if err := store.StoreSCIDVariableDetails(scid, v100, 100); err != nil {
+		t.Fatalf("StoreSCIDVariableDetails(100): %v", err)
+	}
+	if err := store.StoreSCIDVariableDetails(scid, v200, 200); err != nil {
+		t.Fatalf("StoreSCIDVariableDetails(200): %v", err)
+	}
+
+	// Explicit heights keep exact-snapshot semantics.
+	for _, tc := range []struct {
+		height int64
+		want   string
+	}{
+		{100, "old"},
+		{200, "new"},
+	} {
+		vars, err := store.GetSCIDVariableDetailsAtHeight(scid, tc.height)
+		if err != nil {
+			t.Fatalf("AtHeight(%d): %v", tc.height, err)
+		}
+		if len(vars) == 0 || vars[0].Value != tc.want {
+			t.Fatalf("AtHeight(%d): want song=%q, got %+v", tc.height, tc.want, vars)
+		}
+	}
+
+	// 0 resolves to the latest stored snapshot.
+	vars, err := store.GetSCIDVariableDetailsAtHeight(scid, 0)
+	if err != nil {
+		t.Fatalf("AtHeight(0): %v", err)
+	}
+	if len(vars) != 2 || vars[0].Value != "new" {
+		t.Fatalf("AtHeight(0): want latest snapshot (2 vars, song=new), got %+v", vars)
+	}
+
+	// Negative heights behave the same as 0.
+	if vars, err = store.GetSCIDVariableDetailsAtHeight(scid, -1); err != nil || len(vars) != 2 {
+		t.Fatalf("AtHeight(-1): want latest snapshot, got %+v (err %v)", vars, err)
+	}
+
+	// Unknown SCID: nil, no error.
+	if vars, err = store.GetSCIDVariableDetailsAtHeight(fakeSCID(), 0); err != nil || vars != nil {
+		t.Fatalf("unknown scid: want nil,nil, got %+v (err %v)", vars, err)
+	}
+
+	// Empty scid: nil, no error.
+	if vars, err = store.GetSCIDVariableDetailsAtHeight("", 0); err != nil || vars != nil {
+		t.Fatalf("empty scid: want nil,nil, got %+v (err %v)", vars, err)
+	}
+}

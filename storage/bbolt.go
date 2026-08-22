@@ -489,8 +489,19 @@ func (s *BboltStore) GetSCIDVariableDetailsAtHeight(scid string, height int64) (
 }
 
 func getSCIDVariablesAtHeightTx(tx *bolt.Tx, scid string, height int64) ([]*structures.SCIDVariable, error) {
-	if scid == "" || height <= 0 {
+	if scid == "" {
 		return nil, nil
+	}
+	if height <= 0 {
+		// Civilware compat contract: height 0/negative means "latest snapshot"
+		// (pkg/gnomes/storage.GetAllSCIDVariableDetails passes 0 verbatim).
+		// Resolve via the latest-height index, falling back to a prefix scan
+		// when the index entry is missing (same pattern as
+		// GetRatingsAndSummaryForSCID).
+		height = latestSCVarsHeightTx(tx, scid)
+		if height <= 0 {
+			return nil, nil
+		}
 	}
 	key := fmt.Sprintf("%s:%d", scid, height)
 	v := tx.Bucket(bucketScVars).Get([]byte(key))

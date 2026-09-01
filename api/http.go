@@ -852,13 +852,17 @@ func (s *Server) handleGetAddressCreatedAssets(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, "failed to get owner SCIDs: "+err.Error())
 		return
 	}
+	// Bulk-read class metadata in one View txn instead of one per SCID; for
+	// an owner of N asset contracts this is 2 Views (the GetSCIDsByOwner
+	// prefix scan above + this bulk lookup) rather than N+1.
+	metas, err := s.store.GetSCIDClassBulk(scids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
+		return
+	}
 	installs := make([]structures.ClassInstall, 0, len(scids))
 	for _, scid := range scids {
-		meta, err := s.store.GetSCIDClass(scid)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
-			return
-		}
+		meta := metas[scid]
 		if !isAssetMeta(meta) {
 			continue
 		}
@@ -910,25 +914,38 @@ func (s *Server) handleGetAddressTouchedAssets(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Bulk-read class metadata + owners in two Views instead of 2N per-SCID
+	// Views; for an address that touched N asset contracts this collapses
+	// 2N+1 Views to 3 (the GetAddressSCIDs prefix scan above + these two
+	// bulk lookups). Both bulk methods reuse one cursor + one key-scratch
+	// across all N lookups inside a single View txn.
+	scids := make([]string, 0, len(touched))
+	for scid, touch := range touched {
+		if touch != nil {
+			scids = append(scids, scid)
+		}
+	}
+	metas, err := s.store.GetSCIDClassBulk(scids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
+		return
+	}
+	owners, err := s.store.GetOwnersForSCIDs(scids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get owners: "+err.Error())
+		return
+	}
+
 	entries := make([]assetEntry, 0, len(touched))
 	for scid, touch := range touched {
 		if touch == nil {
 			continue
 		}
-		meta, err := s.store.GetSCIDClass(scid)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to get asset metadata: "+err.Error())
-			return
-		}
+		meta := metas[scid]
 		if !isAssetMeta(meta) {
 			continue
 		}
-		owner, err := s.store.GetOwner(scid)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to get owner: "+err.Error())
-			return
-		}
-		entry := assetEntryFromMeta(scid, owner, meta)
+		entry := assetEntryFromMeta(scid, owners[scid], meta)
 		entry.FirstTouchHeight = touch.FirstHeight
 		entry.LastTouchHeight = touch.LastHeight
 		entry.TouchCount = touch.Count
@@ -977,6 +994,18 @@ func (s *Server) handleGetAddress(w http.ResponseWriter, r *http.Request) {
 		Name        string `json:"name,omitempty"`
 	}
 
+
+	// Bulk-read all class metadata in one View txn instead of one per SCID;
+	// for an address that touched N SCIDs this is 2 Views total (the
+	// GetAddressSCIDs prefix scan above + this bulk lookup) rather than N+1.
+	scids := make([]string, 0, len(entries))
+	for scid, e := range entries {
+		if e != nil {
+			scids = append(scids, scid)
+		}
+	}
+	metas, _ := s.store.GetSCIDClassBulk(scids)
+
 	out := make([]scidEntry, 0, len(entries))
 	for scid, e := range entries {
 		if e == nil {
@@ -988,7 +1017,7 @@ func (s *Server) handleGetAddress(w http.ResponseWriter, r *http.Request) {
 			LastHeight:  e.LastHeight,
 			Count:       e.Count,
 		}
-		if meta, _ := s.store.GetSCIDClass(scid); meta != nil {
+		if meta := metas[scid]; meta != nil {
 			item.Class = meta.Class
 			item.Name = meta.Name
 		}

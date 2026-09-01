@@ -1460,6 +1460,49 @@ func (s *BboltStore) GetSCIDClass(scid string) (*structures.ClassMeta, error) {
 	return meta, err
 }
 
+// GetSCIDClassBulk reads ClassMeta for every scid in one View transaction.
+// Returns scid -> *ClassMeta; missing scids are simply absent from the map
+// (callers treat absence as "no class record" — same as GetSCIDClass's nil).
+// Decode errors are logged and skipped, matching GetSCIDClass's tolerance on
+// a per-row basis rather than failing the whole batch on one corrupt value.
+//
+// Mirrors GetOwnersForSCIDs: one reused Cursor (skips N cursor allocs), one
+// reused keyScratch (skips N []byte(scid) copies). bucketClassIdx is
+// Put-only (never CreateBucket), so Seek + bytes.Equal reproduces Get's
+// exact-match semantics exactly. For N address-handler lookups this
+// collapses N+1 View txns to 1.
+func (s *BboltStore) GetSCIDClassBulk(scids []string) (map[string]*structures.ClassMeta, error) {
+	out := make(map[string]*structures.ClassMeta, len(scids))
+	if len(scids) == 0 {
+		return out, nil
+	}
+	err := s.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketClassIdx)
+		c := b.Cursor()
+		var keyScratch []byte
+		for _, scid := range scids {
+			if scid == "" {
+				continue
+			}
+			keyScratch = append(keyScratch[:0], scid...)
+			k, v := c.Seek(keyScratch)
+			if k == nil || !bytes.Equal(k, keyScratch) {
+				continue
+			}
+			m, err := decodeClassMeta(v)
+			if err != nil {
+				logger.Warnf("GetSCIDClassBulk decode %s: %v (skipping)", scid, err)
+				continue
+			}
+			if m != nil {
+				out[scid] = m
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // GetInstallsInRange returns installs with height in [fromHeight, toHeight).
 // limit<=0 means unlimited.
 func (s *BboltStore) GetInstallsInRange(fromHeight, toHeight int64, limit int) ([]structures.ClassInstall, error) {

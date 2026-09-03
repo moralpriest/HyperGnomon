@@ -86,6 +86,13 @@ type Storage interface {
 	GetClassInstalls(class string, limit int) ([]structures.ClassInstall, error)
 	GetSCIDClass(scid string) (*structures.ClassMeta, error)
 
+	// GetSCIDClassBulk reads ClassMeta for every scid in one transaction.
+	// Returns scid -> *ClassMeta (nil value for a missing scid). Mirrors
+	// GetOwnersForSCIDs: callers that need N class records should use this
+	// instead of N GetSCIDClass calls, so the N lookups share one View txn
+	// (one cursor, one key-scratch) instead of opening N separate txns.
+	GetSCIDClassBulk(scids []string) (map[string]*structures.ClassMeta, error)
+
 	// Install index — SCIDs installed in height range, prefix-scannable.
 	GetInstallsInRange(fromHeight, toHeight int64, limit int) ([]structures.ClassInstall, error)
 

@@ -324,7 +324,7 @@ Each milestone is shippable on its own. Rough estimates assume one developer.
 
 ## 15. Risks & open questions
 
-- **bbolt write amplification** on nested buckets with millions of entries. Needs a bench pass on M0. Fallback: Pebble. Interface already abstracted via `storage.Storage`.
+- **bbolt write amplification** on nested buckets with millions of entries. Needs a bench pass on M0. The `storage.Storage` interface is already abstracted so a future backend could be slotted in, but no engine swap is warranted today: bbolt wins the measured read paths (PointRead 625 ns, RangeScan 4.8 µs; `storage/dbbench/RESULTS.md`) and the merge-on-write read-back inside `FlushBatch` is cheaper on a B+tree than on any LSM peer.
 - **Daemon mempool semantics.** `GetTransactionPool` returns IDs; we need the full TX to parse SC_INSTALL. Call `GetTransaction` on each novel TXID. Cost = 1 RPC per new mempool tx. Acceptable (DERO mempool is small).
 - **Filter expressivity creep.** Resist adding `OR`, `NOT`, `glob`. When that itch arises, add a new method instead.
 - **Event ordering guarantees.** Within a block, order by (tx position, payload index). Document this; clients cannot assume cross-block ordering under reorg.
